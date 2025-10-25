@@ -24,6 +24,7 @@ import html
 import zipfile
 import tempfile
 import shutil
+import re
 from typing import List, Tuple, Optional
 
 import ebooklib
@@ -85,18 +86,14 @@ def build_partial_xhtml_from_original(original_content: bytes, target_chars: int
                     new_title.string = title
                     head.append(new_title)
             
-            # 添加 CSS 引用
+            # 添加 CSS 引用（使用最小修改方式）
             if css_files:
-                existing_links = head.find_all('link', {'rel': 'stylesheet'})
-                existing_hrefs = {link.get('href') for link in existing_links}
-                
-                for css_file in css_files:
-                    if css_file not in existing_hrefs:
-                        link = soup.new_tag('link')
-                        link['rel'] = 'stylesheet'
-                        link['type'] = 'text/css'
-                        link['href'] = css_file
-                        head.append(link)
+                # 先嘗試用最小修改方式添加 CSS
+                temp_content = add_css_to_xhtml_minimal(original_content, css_files)
+                if temp_content != original_content:
+                    # 重新解析修改後的內容
+                    soup = BeautifulSoup(temp_content, "xml")
+                    head = soup.find('head')
         
         # 處理 body 內容
         body = soup.find('body')
@@ -156,9 +153,29 @@ def build_partial_xhtml_from_original(original_content: bytes, target_chars: int
                 html_tag.append(child)
             soup.append(html_tag)
         
-        # 添加 XML 聲明
-        result = '<?xml version="1.0" encoding="utf-8"?>\n' + str(soup)
-        return result.encode("utf-8")
+        # 確保只有一個 XML 聲明
+        result_str = str(soup)
+        
+        # 檢查是否已經有 XML 聲明
+        if not result_str.strip().startswith('<?xml'):
+            result_str = '<?xml version="1.0" encoding="utf-8"?>\n' + result_str
+        
+        # 移除可能的重複 XML 聲明
+        lines = result_str.split('\n')
+        xml_declaration_count = 0
+        filtered_lines = []
+        
+        for line in lines:
+            if line.strip().startswith('<?xml'):
+                xml_declaration_count += 1
+                if xml_declaration_count == 1:
+                    filtered_lines.append(line)
+                # 跳過後續的XML聲明
+            else:
+                filtered_lines.append(line)
+        
+        result_str = '\n'.join(filtered_lines)
+        return result_str.encode("utf-8")
         
     except Exception as e:
         print(f"處理原始 XHTML 時發生錯誤: {e}")
@@ -269,7 +286,7 @@ def clone_asset_item(src_item: epub.EpubItem) -> epub.EpubItem:
         media_type=src_item.media_type,
         content=src_item.get_content()
     )
-    
+
     # 保留其他可能的屬性
     try:
         if hasattr(src_item, 'properties') and src_item.properties:
@@ -283,23 +300,64 @@ def clone_asset_item(src_item: epub.EpubItem) -> epub.EpubItem:
     
     return cloned
 
-def add_css_to_xhtml(content: bytes, css_files: List[str]) -> bytes:
-    """在 XHTML 內容的 head 部分添加 CSS 引用。"""
+def add_css_to_xhtml_minimal(content: bytes, css_files: List[str]) -> bytes:
+    """以最小修改的方式在 XHTML 內容中添加 CSS 引用，盡可能保留原始格式。"""
     if not css_files:
-        print("沒有 CSS 文件需要添加")
         return content
+    
+    try:
+        content_str = content.decode('utf-8')
         
-    print(f"開始為文件添加 CSS 引用: {css_files}")
+        # 檢查是否已經有 CSS 引用
+        has_existing_css = any(css_file in content_str for css_file in css_files)
+        if has_existing_css:
+            print("文件已包含 CSS 引用，跳過修改")
+            return content
+        
+        # 查找 </head> 標籤的位置
+        head_end = content_str.find('</head>')
+        if head_end != -1:
+            # 在 </head> 前插入 CSS 引用
+            css_links = []
+            for css_file in css_files:
+                css_links.append(f'<link rel="stylesheet" type="text/css" href="{css_file}"/>')
+            
+            css_block = '\n'.join(css_links) + '\n'
+            modified_content = content_str[:head_end] + css_block + content_str[head_end:]
+            print(f"已在 </head> 前添加 {len(css_files)} 個 CSS 引用")
+            return modified_content.encode('utf-8')
+        
+        # 如果沒有 </head>，查找 <head/> 自閉合標籤
+        head_self_closing = content_str.find('<head/>')
+        if head_self_closing != -1:
+            # 替換 <head/> 為 <head>...</head>
+            css_links = []
+            for css_file in css_files:
+                css_links.append(f'<link rel="stylesheet" type="text/css" href="{css_file}"/>')
+            
+            css_block = '<head>\n' + '\n'.join(css_links) + '\n</head>'
+            modified_content = content_str[:head_self_closing] + css_block + content_str[head_self_closing + 7:]
+            print(f"已替換 <head/> 並添加 {len(css_files)} 個 CSS 引用")
+            return modified_content.encode('utf-8')
+        
+        # 如果找不到 head 標籤，回退到 BeautifulSoup 方法
+        print("未找到 head 標籤，使用 BeautifulSoup 方法")
+        return add_css_to_xhtml_fallback(content, css_files)
+        
+    except Exception as e:
+        print(f"最小修改方式失敗，回退到 BeautifulSoup: {e}")
+        return add_css_to_xhtml_fallback(content, css_files)
+
+def add_css_to_xhtml_fallback(content: bytes, css_files: List[str]) -> bytes:
+    """BeautifulSoup 回退方法，用於處理複雜情況。"""
     try:
         soup = BeautifulSoup(content, "xml")
         head = soup.find('head')
-        print(f"找到 head 標籤: {head}")
         
         if head:
-            # 檢查是否已經有 CSS 引用
+            # 檢查現有的 CSS 引用
             existing_links = head.find_all('link', {'rel': 'stylesheet'})
             existing_hrefs = {link.get('href') for link in existing_links}
-            print(f"現有 CSS 引用: {existing_hrefs}")
             
             # 添加缺少的 CSS 引用
             for css_file in css_files:
@@ -309,11 +367,8 @@ def add_css_to_xhtml(content: bytes, css_files: List[str]) -> bytes:
                     link['type'] = 'text/css'
                     link['href'] = css_file
                     head.append(link)
-                    print(f"已添加 CSS 引用到 head: {css_file}")
-                else:
-                    print(f"CSS 引用已存在，跳過: {css_file}")
         else:
-            # 如果沒有 head 標籤，創建一個
+            # 創建 head 標籤
             html_tag = soup.find('html')
             if html_tag:
                 new_head = soup.new_tag('head')
@@ -323,9 +378,6 @@ def add_css_to_xhtml(content: bytes, css_files: List[str]) -> bytes:
                     link['type'] = 'text/css'
                     link['href'] = css_file
                     new_head.append(link)
-                    print(f"已創建 head 並添加 CSS 引用: {css_file}")
-                
-                # 將 head 插入到 html 標籤的開始
                 html_tag.insert(0, new_head)
         
         # 確保有 XML 聲明
@@ -333,16 +385,13 @@ def add_css_to_xhtml(content: bytes, css_files: List[str]) -> bytes:
         if not result.startswith('<?xml'):
             result = '<?xml version="1.0" encoding="utf-8"?>\n' + result
         
-        print(f"CSS 添加完成，head 部分: {soup.find('head')}")
         return result.encode("utf-8")
     except Exception as e:
-        print(f"添加 CSS 引用時發生錯誤: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"BeautifulSoup 方法也失敗: {e}")
         return content
 
 def clone_document_item(src_item: epub.EpubHtml, title: str = None, css_files: List[str] = None) -> epub.EpubHtml:
-    """複製完整文件章節（保持原檔名/媒體型別/標題/所有屬性），並自動添加 CSS 引用。"""
+    """複製完整文件章節（保持原檔名/媒體型別/標題/所有屬性），盡可能保留原始格式。"""
     cloned = epub.EpubHtml(
         uid=src_item.get_id(),
         file_name=src_item.file_name,
@@ -350,10 +399,20 @@ def clone_document_item(src_item: epub.EpubHtml, title: str = None, css_files: L
         title=title if title is not None else (getattr(src_item, "title", "") or "")
     )
     
-    # 完整複製內容並添加 CSS 引用
+    # 完整複製內容，保持原始格式
     original_content = src_item.get_content()
-    if css_files:
-        modified_content = add_css_to_xhtml(original_content, css_files)
+    
+    # 檢查原始內容是否已經有CSS引用
+    content_str = original_content.decode('utf-8')
+    has_css_reference = 'stylesheet' in content_str
+    
+    if has_css_reference:
+        # 如果原始文件已經有CSS引用，保持原樣，不添加額外的CSS
+        print(f"保持原始CSS引用: {src_item.file_name}")
+        cloned.content = original_content
+    elif css_files:
+        # 只有在沒有CSS引用時才添加
+        modified_content = add_css_to_xhtml_minimal(original_content, css_files)
         cloned.content = modified_content
         print(f"已為 {src_item.file_name} 添加 CSS 引用，內容長度: {len(modified_content)}")
     else:
@@ -376,12 +435,63 @@ def clone_document_item(src_item: epub.EpubHtml, title: str = None, css_files: L
     
     return cloned
 
-def post_process_epub_css(epub_path: str, css_files: List[str]) -> None:
-    """後處理 EPUB 文件，在所有 XHTML 文件中添加 CSS 引用，並修正排版問題。"""
+def create_raw_xhtml_item(uid: str, file_name: str, title: str, content: bytes) -> epub.EpubItem:
+    """創建原始 XHTML 項目，完全保留原始內容格式"""
+    item = epub.EpubItem(
+        uid=uid,
+        file_name=file_name,
+        media_type="application/xhtml+xml",
+        content=content
+    )
+    return item
+
+def fix_css_paths_in_content(content: bytes, css_path_mapping: dict) -> bytes:
+    """修正 XHTML 內容中的 CSS 路徑引用"""
+    try:
+        content_str = content.decode('utf-8')
+        
+        # 查找所有 CSS 引用
+        css_pattern = r'href="([^"]*\.css)"'
+        matches = re.findall(css_pattern, content_str)
+        
+        for original_href in matches:
+            # 處理相對路徑
+            if original_href.startswith('../'):
+                # 移除 ../ 前綴
+                clean_path = original_href[3:]
+                if clean_path in css_path_mapping.values():
+                    # 替換為正確的路徑
+                    content_str = content_str.replace(f'href="{original_href}"', f'href="{clean_path}"')
+                    print(f"修正CSS路徑: {original_href} -> {clean_path}")
+            else:
+                # 檢查是否需要路徑映射
+                for original_path, corrected_path in css_path_mapping.items():
+                    if original_href == original_path or original_href.endswith(original_path.split('/')[-1]):
+                        content_str = content_str.replace(f'href="{original_href}"', f'href="{corrected_path}"')
+                        print(f"修正CSS路徑: {original_href} -> {corrected_path}")
+                        break
+        
+        return content_str.encode('utf-8')
+    except Exception as e:
+        print(f"修正CSS路徑時發生錯誤: {e}")
+        return content
+
+def post_process_epub_restore_original(epub_path: str, original_epub_path: str, css_files: List[str]) -> None:
+    """後處理 EPUB 文件，恢復原始內容格式並確保CSS引用正確。"""
     if not css_files:
         return
     
-    print(f"開始後處理 EPUB 文件，添加 CSS 引用和修正排版: {css_files}")
+    print(f"開始後處理 EPUB 文件，恢復原始格式: {css_files}")
+    
+    # 讀取原始EPUB內容作為參考
+    original_contents = {}
+    with zipfile.ZipFile(original_epub_path, 'r') as orig_zip:
+        for file_info in orig_zip.infolist():
+            if file_info.filename.endswith('.xhtml') or file_info.filename.endswith('.html'):
+                try:
+                    original_contents[file_info.filename] = orig_zip.read(file_info.filename)
+                except:
+                    pass
     
     # 創建臨時目錄
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -389,63 +499,115 @@ def post_process_epub_css(epub_path: str, css_files: List[str]) -> None:
         with zipfile.ZipFile(epub_path, 'r') as zip_ref:
             zip_ref.extractall(temp_dir)
         
+        processed_count = 0
+        restored_count = 0
+        
         # 處理所有 XHTML 文件
         for root, dirs, files in os.walk(temp_dir):
             for file in files:
                 if file.endswith('.xhtml') or file.endswith('.html'):
                     file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(file_path, temp_dir)
+                    
+                    # 查找對應的原始文件
+                    original_key = None
+                    for orig_path in original_contents.keys():
+                        if orig_path.endswith(file) or file in orig_path:
+                            original_key = orig_path
+                            break
+                    
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
-                            content = f.read()
+                            current_content = f.read()
                         
-                        # 解析並添加 CSS 引用
-                        soup = BeautifulSoup(content, 'xml')
-                        head = soup.find('head')
-                        html_tag = soup.find('html')
+                        # 如果找到原始內容，且當前內容被ebooklib重新格式化了
+                        if original_key and original_key in original_contents:
+                            original_content = original_contents[original_key].decode('utf-8')
+                            
+                            # 檢查是否需要恢復原始格式（比較body標籤）
+                            needs_restore = False
+                            if '<body class=' in original_content and '<body class=' not in current_content:
+                                needs_restore = True
+                                print(f"檢測到 {file} 的 body class 被移除，需要恢復原始格式")
+                            elif 'class="hltr"' in original_content and 'class="hltr"' not in current_content:
+                                needs_restore = True
+                                print(f"檢測到 {file} 的 html class 被移除，需要恢復原始格式")
+                            
+                            if needs_restore:
+                                # 恢復原始內容，但修正CSS路徑
+                                restored_content = fix_css_paths_in_content(original_contents[original_key], {})
+                                
+                                # 確保內容以正確的XML聲明開頭，沒有多餘的空白
+                                if restored_content.startswith(b'\xef\xbb\xbf'):  # 移除BOM
+                                    restored_content = restored_content[3:]
+                                
+                                # 確保開頭沒有空白字符
+                                restored_content = restored_content.lstrip()
+                                
+                                # 如果不是以XML聲明開頭，添加它
+                                if not restored_content.startswith(b'<?xml'):
+                                    xml_declaration = b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                                    restored_content = xml_declaration + restored_content
+                                
+                                with open(file_path, 'wb') as f:
+                                    f.write(restored_content)
+                                print(f"已恢復 {file} 的原始格式")
+                                restored_count += 1
+                                continue
+                        
+                        # 檢查是否已經有CSS引用
+                        if 'stylesheet' in current_content:
+                            print(f"跳過 {file}，已有CSS引用")
+                            continue
+                        
+                        # 只對沒有CSS引用的文件進行處理
+                        modified_content = add_css_to_xhtml_minimal(current_content.encode('utf-8'), css_files)
+                        current_content = modified_content.decode('utf-8')
                         
                         # 檢查是否需要添加 page class（針對書名頁等橫排內容）
                         needs_page_class = False
-                        if html_tag and soup.find(class_='tittlepage'):
+                        if 'tittlepage' in current_content:
                             needs_page_class = True
                             print(f"檢測到 {file} 包含 tittlepage，需要橫排顯示")
                         
-                        # 為 html 標籤添加 page class
-                        if needs_page_class and html_tag:
-                            current_class = html_tag.get('class', [])
-                            if isinstance(current_class, str):
-                                current_class = [current_class]
-                            elif current_class is None:
-                                current_class = []
+                        # 如果需要添加 page class，才使用 BeautifulSoup
+                        if needs_page_class:
+                            soup = BeautifulSoup(current_content, 'xml')
+                            html_tag = soup.find('html')
                             
-                            if 'page' not in current_class:
-                                current_class.append('page')
-                                html_tag['class'] = current_class
-                                print(f"已為 {file} 的 html 標籤添加 page class")
+                            if html_tag:
+                                current_class = html_tag.get('class', [])
+                                if isinstance(current_class, str):
+                                    current_class = [current_class]
+                                elif current_class is None:
+                                    current_class = []
+                                
+                                if 'page' not in current_class:
+                                    current_class.append('page')
+                                    html_tag['class'] = current_class
+                                    print(f"已為 {file} 的 html 標籤添加 page class")
+                                    current_content = str(soup)
                         
-                        if head:
-                            # 檢查現有的 CSS 引用
-                            existing_links = head.find_all('link', {'rel': 'stylesheet'})
-                            existing_hrefs = {link.get('href') for link in existing_links}
-                            
-                            # 添加缺少的 CSS 引用
-                            added_css = False
-                            for css_file in css_files:
-                                if css_file not in existing_hrefs:
-                                    link = soup.new_tag('link')
-                                    link['rel'] = 'stylesheet'
-                                    link['type'] = 'text/css'
-                                    link['href'] = css_file
-                                    head.append(link)
-                                    added_css = True
-                            
-                            if added_css or needs_page_class:
-                                # 寫回文件
-                                with open(file_path, 'w', encoding='utf-8') as f:
-                                    f.write(str(soup))
-                                print(f"已更新 {file}")
+                        # 確保內容格式正確
+                        current_content_bytes = current_content.encode('utf-8')
+                        
+                        # 移除BOM如果存在
+                        if current_content_bytes.startswith(b'\xef\xbb\xbf'):
+                            current_content_bytes = current_content_bytes[3:]
+                        
+                        # 確保開頭沒有多餘空白
+                        current_content_bytes = current_content_bytes.lstrip()
+                        
+                        # 寫回文件
+                        with open(file_path, 'wb') as f:
+                            f.write(current_content_bytes)
+                        print(f"已更新 {file}")
+                        processed_count += 1
                     
                     except Exception as e:
                         print(f"處理文件 {file} 時發生錯誤: {e}")
+        
+        print(f"後處理完成，恢復了 {restored_count} 個文件的原始格式，處理了 {processed_count} 個其他文件")
         
         # 重新打包 EPUB
         with zipfile.ZipFile(epub_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
@@ -457,7 +619,12 @@ def post_process_epub_css(epub_path: str, css_files: List[str]) -> None:
     
     print("EPUB 後處理完成")
 
-def make_epub_sample_10pct(input_path: str, output_path: str, include_cover: bool = True, complete_chapters_only: bool = False) -> str:
+def post_process_epub_css(epub_path: str, css_files: List[str]) -> None:
+    """後處理 EPUB 文件，只處理需要添加 CSS 的文件，保留原始格式的文件不做修改。"""
+    # 這個函數保留作為備用
+    pass
+
+def make_epub_sample_10pct(input_path: str, output_path: str, include_cover: bool = True, complete_chapters_only: bool = True) -> str:
     """建立新的 EPUB，內容為前 10%（最後一章以純文字截斷），封面可選擇加入且置於最前。"""
     book = epub.read_epub(input_path)
     spine_items = get_spine_doc_items(book)
@@ -545,10 +712,22 @@ def make_epub_sample_10pct(input_path: str, output_path: str, include_cover: boo
     except Exception as e:
         print(f"檢查遺漏資源時發生錯誤: {e}")
 
-    # 收集所有 CSS 文件路徑
+    # 收集所有 CSS 文件路徑，並修正路徑
     css_files = []
+    css_path_mapping = {}
+    
     for item in book.get_items_of_type(ebooklib.ITEM_STYLE):
-        css_files.append(item.file_name)
+        original_path = item.file_name
+        # 修正路徑：移除 item/ 前綴（如果存在）
+        if original_path.startswith('item/'):
+            corrected_path = original_path[5:]  # 移除 'item/' 前綴
+        else:
+            corrected_path = original_path
+        
+        css_files.append(corrected_path)
+        css_path_mapping[original_path] = corrected_path
+        print(f"CSS 路徑映射: {original_path} -> {corrected_path}")
+    
     print(f"發現 CSS 文件: {css_files}")
 
     include_items = []
@@ -611,12 +790,28 @@ def make_epub_sample_10pct(input_path: str, output_path: str, include_cover: boo
         ch_txt = chapter_texts[idx]
 
         if collected + ch_len < target:
-            # 整章保留原排版與原標題，並添加 CSS 引用
-            cloned = clone_document_item(it, title=(getattr(it, "title", "") or f"章節 {idx+1}"), css_files=css_files)
-            new_book.add_item(cloned)
-            include_items.append(cloned)
-            new_spine.append(cloned)
+            # 整章保留原排版與原標題，使用直接複製方式
+            original_content = it.get_content()
+            
+            # 修正CSS路徑
+            if css_path_mapping:
+                fixed_content = fix_css_paths_in_content(original_content, css_path_mapping)
+            else:
+                fixed_content = original_content
+            
+            # 創建原始XHTML項目，完全保留格式
+            raw_item = create_raw_xhtml_item(
+                uid=it.get_id(),
+                file_name=it.file_name,
+                title=(getattr(it, "title", "") or f"章節 {idx+1}"),
+                content=fixed_content
+            )
+            
+            new_book.add_item(raw_item)
+            include_items.append(raw_item)
+            new_spine.append(raw_item)
             collected += ch_len
+            print(f"直接複製章節: {it.file_name} (保留原始格式)")
         else:
             if complete_chapters_only:
                 # 只包含完整章節，不產生部分章節
@@ -627,30 +822,54 @@ def make_epub_sample_10pct(input_path: str, output_path: str, include_cover: boo
                 remain = target - collected
                 partial_title = getattr(it, "title", "") or ""
                 
-                # 使用新的函數來保留原始排版
+                # 使用原始內容創建部分章節，保留格式
                 try:
+                    original_content = it.get_content()
+                    
+                    # 修正CSS路徑
+                    if css_path_mapping:
+                        fixed_content = fix_css_paths_in_content(original_content, css_path_mapping)
+                    else:
+                        fixed_content = original_content
+                    
+                    # 截斷內容但保留HTML結構
                     partial_content = build_partial_xhtml_from_original(
-                        it.get_content(), 
+                        fixed_content, 
                         remain, 
                         partial_title,
                         css_files
                     )
+                    
+                    # 創建原始XHTML項目
+                    partial_item = create_raw_xhtml_item(
+                        uid=f"partial_{idx+1}",
+                        file_name=f"partial_{idx+1}.xhtml",
+                        title=partial_title,
+                        content=partial_content
+                    )
+                    
+                    new_book.add_item(partial_item)
+                    include_items.append(partial_item)
+                    new_spine.append(partial_item)
+                    print(f"已建立保留原始格式的部分章節: {partial_title} ({remain} 字元)")
+                    
                 except Exception as e:
                     print(f"使用原始結構處理部分章節失敗，回退到純文字: {e}")
                     partial_text = ch_txt[:remain] if remain > 0 else ""
                     partial_content = build_partial_xhtml_fallback(partial_title, partial_text)
-                
-                partial_html = epub.EpubHtml(
+                    
+                    partial_item = create_raw_xhtml_item(
                     uid=f"partial_{idx+1}",
                     file_name=f"partial_{idx+1}.xhtml",
                     title=partial_title,
-                    lang="zh"
-                )
-                partial_html.content = partial_content
-                new_book.add_item(partial_html)
-                include_items.append(partial_html)
-                new_spine.append(partial_html)
-                print(f"已建立保留排版的部分章節: {partial_title} ({remain} 字元)")
+                        content=partial_content
+                    )
+                    
+                    new_book.add_item(partial_item)
+                    include_items.append(partial_item)
+                    new_spine.append(partial_item)
+                    print(f"已建立部分章節（回退模式）: {partial_title} ({remain} 字元)")
+                
                 break
 
     # 導覽與目錄（⚠ 將 nav 放在 spine 的最後，避免成為第一頁）
@@ -664,9 +883,9 @@ def make_epub_sample_10pct(input_path: str, output_path: str, include_cover: boo
 
     epub.write_epub(output_path, new_book)
     
-    # 後處理：添加 CSS 引用
+    # 後處理：恢復原始格式並添加 CSS 引用
     if css_files:
-        post_process_epub_css(output_path, css_files)
+        post_process_epub_restore_original(output_path, input_path, css_files)
     
     return output_path
 
@@ -675,7 +894,7 @@ def main():
     ap.add_argument("input", help="輸入 EPUB 檔案路徑")
     ap.add_argument("--output", help="輸出檔名（預設自動加 _sample.epub）")
     ap.add_argument("--no-cover", action="store_true", help="不加入封面頁")
-    ap.add_argument("--complete-chapters-only", action="store_true", help="只包含完整章節，不生成部分章節")
+    ap.add_argument("--allow-partial-chapters", action="store_true", help="允許生成部分章節以精確達到10%%字數（預設只包含完整章節）")
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -686,7 +905,9 @@ def main():
     out = args.output or f"{base}_sample.epub"
 
     try:
-        path = make_epub_sample_10pct(args.input, out, include_cover=(not args.no_cover), complete_chapters_only=args.complete_chapters_only)
+        # 預設為完整章節模式，除非明確指定允許部分章節
+        complete_chapters_only = not args.allow_partial_chapters
+        path = make_epub_sample_10pct(args.input, out, include_cover=(not args.no_cover), complete_chapters_only=complete_chapters_only)
         print(f"已輸出 EPUB 節錄：{path}")
     except Exception as e:
         print(f"處理失敗：{e}", file=sys.stderr)
