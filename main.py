@@ -421,6 +421,7 @@ def clone_document_item(src_item: epub.EpubHtml, title: str = None, css_files: L
     # 保留所有可能的屬性
     try:
         if hasattr(src_item, 'lang') and src_item.lang:
+            print(f"複製文件屬性: {src_item.file_name} -> lang={src_item.lang}")
             cloned.lang = src_item.lang
         if hasattr(src_item, 'direction') and src_item.direction:
             cloned.direction = src_item.direction
@@ -619,6 +620,151 @@ def post_process_epub_restore_original(epub_path: str, original_epub_path: str, 
     
     print("EPUB 後處理完成")
 
+def post_process_epub_spine_config(epub_path: str, original_epub_path: str) -> None:
+    """後處理 EPUB 文件，修復 spine 配置（page-progression-direction 和 itemref properties）。"""
+    print("開始修復 EPUB spine 配置...")
+    
+    # 讀取原始 EPUB 的 spine 配置
+    original_spine_config = None
+    original_itemref_properties = {}
+    
+    try:
+        with zipfile.ZipFile(original_epub_path, 'r') as orig_zip:
+            # 查找 content.opf 文件
+            opf_files = [f for f in orig_zip.namelist() if f.endswith('.opf')]
+            if opf_files:
+                opf_content = orig_zip.read(opf_files[0]).decode('utf-8')
+                
+                # 解析 spine 配置
+                lines = opf_content.split('\n')
+                in_spine = False
+                for line in lines:
+                    if '<spine' in line:
+                        in_spine = True
+                        # 提取 spine 屬性
+                        if 'page-progression-direction=' in line:
+                            import re
+                            match = re.search(r'page-progression-direction="([^"]*)"', line)
+                            if match:
+                                original_spine_config = {'page-progression-direction': match.group(1)}
+                                print(f"發現原始 spine 配置: page-progression-direction={match.group(1)}")
+                    elif in_spine and '</spine>' in line:
+                        break
+                    elif in_spine and 'itemref' in line:
+                        # 提取 itemref 的所有屬性（properties, linear 等）
+                        import re
+                        idref_match = re.search(r'idref="([^"]*)"', line)
+                        if idref_match:
+                            item_id = idref_match.group(1)
+                            
+                            # 提取所有屬性
+                            attributes = {}
+                            
+                            # 檢查 properties 屬性
+                            props_match = re.search(r'properties="([^"]*)"', line)
+                            if props_match:
+                                attributes['properties'] = props_match.group(1)
+                            
+                            # 檢查 linear 屬性
+                            linear_match = re.search(r'linear="([^"]*)"', line)
+                            if linear_match:
+                                attributes['linear'] = linear_match.group(1)
+                            
+                            # 如果有任何特殊屬性，記錄下來
+                            if attributes:
+                                original_itemref_properties[item_id] = attributes
+                                print(f"發現 itemref 屬性: {item_id} -> {attributes}")
+    
+    except Exception as e:
+        print(f"讀取原始 EPUB spine 配置時發生錯誤: {e}")
+        return
+    
+    # 如果沒有找到特殊配置，跳過處理
+    if not original_spine_config and not original_itemref_properties:
+        print("未發現需要修復的 spine 配置")
+        return
+    
+    # 修改生成的 EPUB
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # 解壓 EPUB
+            with zipfile.ZipFile(epub_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+            
+            # 查找並修改 content.opf
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file.endswith('.opf'):
+                        opf_path = os.path.join(root, file)
+                        
+                        with open(opf_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        # 修改 spine 標籤
+                        if original_spine_config:
+                            import re
+                            # 查找 <spine 標籤並添加屬性
+                            spine_pattern = r'<spine([^>]*?)>'
+                            def replace_spine(match):
+                                existing_attrs = match.group(1)
+                                if 'page-progression-direction=' not in existing_attrs:
+                                    page_dir = original_spine_config['page-progression-direction']
+                                    new_attrs = f'{existing_attrs} page-progression-direction="{page_dir}"'
+                                    return f'<spine{new_attrs}>'
+                                return match.group(0)
+                            
+                            content = re.sub(spine_pattern, replace_spine, content)
+                            print("已添加 page-progression-direction 屬性")
+                        
+                        # 修改 itemref 標籤
+                        if original_itemref_properties:
+                            import re
+                            for item_id, attributes in original_itemref_properties.items():
+                                # 查找對應的 itemref 並添加所有屬性
+                                itemref_pattern = f'<itemref idref="{item_id}"([^>]*?)/?>'
+                                def replace_itemref(match):
+                                    existing_attrs = match.group(1)
+                                    new_attrs = existing_attrs
+                                    
+                                    # 添加 linear 屬性
+                                    if 'linear' in attributes and 'linear=' not in existing_attrs:
+                                        linear_value = attributes['linear']
+                                        new_attrs += f' linear="{linear_value}"'
+                                    
+                                    # 添加 properties 屬性
+                                    if 'properties' in attributes and 'properties=' not in existing_attrs:
+                                        properties_value = attributes['properties']
+                                        new_attrs += f' properties="{properties_value}"'
+                                    
+                                    return f'<itemref idref="{item_id}"{new_attrs}/>'
+                                
+                                content = re.sub(itemref_pattern, replace_itemref, content)
+                                added_attrs = []
+                                if 'linear' in attributes:
+                                    added_attrs.append(f'linear="{attributes["linear"]}"')
+                                if 'properties' in attributes:
+                                    added_attrs.append(f'properties="{attributes["properties"]}"')
+                                print(f"已為 {item_id} 添加屬性: {', '.join(added_attrs)}")
+                        
+                        # 寫回文件
+                        with open(opf_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        
+                        break
+            
+            # 重新打包 EPUB
+            with zipfile.ZipFile(epub_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
+                for root, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arc_path = os.path.relpath(file_path, temp_dir)
+                        zip_ref.write(file_path, arc_path)
+        
+        print("EPUB spine 配置修復完成")
+    
+    except Exception as e:
+        print(f"修復 EPUB spine 配置時發生錯誤: {e}")
+
 def post_process_epub_css(epub_path: str, css_files: List[str]) -> None:
     """後處理 EPUB 文件，只處理需要添加 CSS 的文件，保留原始格式的文件不做修改。"""
     # 這個函數保留作為備用
@@ -704,7 +850,8 @@ def make_epub_sample_10pct(input_path: str, output_path: str, include_cover: boo
         for item in manifest_items:
             if item.get_id() not in added_items:
                 try:
-                    new_book.add_item(clone_asset_item(item))
+                    cloned_asset = clone_asset_item(item)
+                    new_book.add_item(cloned_asset)
                     added_items.add(item.get_id())
                     print(f"補充複製遺漏的資源: {item.file_name}")
                 except Exception as e:
@@ -872,20 +1019,48 @@ def make_epub_sample_10pct(input_path: str, output_path: str, include_cover: boo
                 
                 break
 
-    # 導覽與目錄（⚠ 將 nav 放在 spine 的最後，避免成為第一頁）
-    # 過濾掉partial頁面，只在TOC中包含完整章節
-    # toc_items = [item for item in include_items if not item.get_id().startswith('partial_')]
-    # new_book.toc = toc_items
-    # new_book.add_item(epub.EpubNcx())
-    nav = epub.EpubNav()
-    # new_book.add_item(nav)
-    new_book.spine = new_spine + ["nav"]   # 讓封面與內容先展示，nav 最後
+    # 保留原始 EPUB 的 spine 配置（包括 page-progression-direction 和 itemref properties）
+    original_spine_config = {}
+    
+    # 檢查原始 spine 的配置
+    if hasattr(book, 'spine') and book.spine:
+        # 創建原始 spine 項目的映射
+        original_spine_items = {}
+        for spine_item in book.spine:
+            if isinstance(spine_item, tuple) and len(spine_item) >= 2:
+                item_id, properties = spine_item[0], spine_item[1]
+                original_spine_items[item_id] = properties
+        
+        # 構建新的 spine，保留原始屬性
+        new_spine_with_properties = []
+        for item in new_spine:
+            item_id = item.get_id() if hasattr(item, 'get_id') else str(item)
+            if item_id in original_spine_items:
+                # 保留原始屬性
+                new_spine_with_properties.append((item_id, original_spine_items[item_id]))
+                print(f"保留 spine 項目屬性: {item_id} -> {original_spine_items[item_id]}")
+            else:
+                # 新項目使用默認屬性
+                new_spine_with_properties.append(item_id)
+        
+        # 添加導航
+        new_spine_with_properties.append("nav")
+        new_book.spine = new_spine_with_properties
+        
+        print(f"已設置 spine 配置，包含 {len(new_spine_with_properties)} 個項目")
+    else:
+        # 回退到簡單模式
+        nav = epub.EpubNav()
+        new_book.spine = new_spine + ["nav"]
 
     epub.write_epub(output_path, new_book)
     
     # 後處理：恢復原始格式並添加 CSS 引用
     if css_files:
         post_process_epub_restore_original(output_path, input_path, css_files)
+    
+    # 後處理：修復 spine 配置（page-progression-direction 和 itemref properties）
+    post_process_epub_spine_config(output_path, input_path)
     
     return output_path
 
